@@ -1,37 +1,47 @@
 """
-AI Text Summarizer (CLI)
-========================
-A beginner-friendly command-line AI tool that summarizes text using
-OpenAI or Google Gemini with Structured Outputs (guaranteed JSON).
+AI Text Summarizer (CLI & Web)
+==============================
+A beginner-friendly AI tool using ONLY the Google Gemini API (google-genai SDK).
+Demonstrates:
+  1. Native Structured Outputs (response_schema)
+  2. Gemini Function Calling (--mode function)
+  3. Prompt Engineering (Role, Constraints, Few-Shot, Anti-Hallucination)
+  4. LangChain LCEL Mode (--langchain)
+  5. Chunking / Map-Reduce for long documents (--chunk)
+  6. Web deployment support (--web)
 
-Author: Antigravity Pair Programmer
 Language: Python 3
+SDK: google-genai
 """
 
 import os
 import sys
 import json
 import argparse
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
-# Rich terminal styling (with standard fallback)
+# Rich terminal styling (with clean fallback)
 try:
     from rich.console import Console
     from rich.panel import Panel
     from rich.table import Table
     from rich.syntax import Syntax
-    from rich import print as rprint
     RICH_AVAILABLE = True
     console = Console()
 except ImportError:
     RICH_AVAILABLE = False
     console = None
 
+# Google GenAI SDK
+from google import genai
+from google.genai import types
 
-# Default model names
-DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+
+# =====================================================================
+# DEFAULT CONFIGURATION
+# =====================================================================
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 
 
@@ -39,22 +49,21 @@ DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 # 1. STRUCTURED OUTPUT SCHEMA (Pydantic Model)
 # =====================================================================
 # What is Structured Output?
-# Traditional LLMs output free-form text, which can sometimes deviate
-# from what your code expects. Structured Outputs enforce a strict JSON
-# schema so the model is mathematically constrained to return valid JSON
-# matching the exact fields and data types we define here.
+# Traditional LLMs output free-form text. Structured Outputs force the
+# model to adhere strictly to a JSON schema, ensuring every required
+# field and data type is returned exactly as specified.
 # =====================================================================
 
 class SummaryResponse(BaseModel):
     """
     Pydantic schema defining the structure of the LLM response.
-    Both OpenAI and Google Gemini use this schema to shape their output.
+    Gemini uses this schema to shape its output in structured mode.
     """
     summary: str = Field(
         description="The summary of the input text matching the requested style."
     )
     key_points: list[str] = Field(
-        description="A list of 3 to 5 key takeaways or core points from the text."
+        description="A list of 3 to 5 core takeaways or key points from the text."
     )
     keywords: list[str] = Field(
         description="A list of 3 to 5 relevant keywords or topic tags."
@@ -62,130 +71,115 @@ class SummaryResponse(BaseModel):
 
 
 # =====================================================================
-# 2. PROMPT ENGINEERING
+# 2. PROMPT ENGINEERING (Techniques from the Prompting Guide)
 # =====================================================================
-# Prompt Engineering is how we instruct the model to produce the best result.
-# We apply three core techniques:
-# 1. Role: Defines who the model is (Executive AI Summarizer).
-# 2. Instructions: Clear guidelines on tone, length, and hallucination prevention.
-# 3. Output Format: Explicit schema rules (short/detailed/bullet points).
+# Prompt Engineering Techniques Used:
+# 1. Role: Establishes persona ("Expert executive research assistant").
+# 2. Clear Instructions: Explicit rules for short, detailed, or bullet styles.
+# 3. Output Format: Strict schema adherence instructions.
+# 4. One Few-Shot Example: Provides a concrete example of input -> output.
+# 5. "Do Not Invent Facts": Explicit anti-hallucination guardrail.
 # =====================================================================
 
 def build_prompt(text: str, style: str) -> Tuple[str, str]:
     """
-    Constructs the system prompt and user prompt based on the selected style.
-    
-    Args:
-        text: The source text to summarize.
-        style: 'short', 'detailed', or 'bullet_points'.
-        
-    Returns:
-        tuple of (system_prompt, user_prompt)
+    Builds system prompt and user prompt applying prompt engineering best practices.
     """
     style_guidelines = {
         "short": (
             "- Write a concise summary of exactly 2-3 sentences.\n"
-            "- Focus only on the overarching message without minor details."
+            "- Focus strictly on the overarching thesis."
         ),
         "detailed": (
-            "- Write a comprehensive summary (1-2 detailed paragraphs).\n"
-            "- Cover the main thesis, supporting context, and conclusion thoroughly."
+            "- Write an in-depth, comprehensive summary (1-2 detailed paragraphs).\n"
+            "- Cover the core thesis, supporting arguments, and final takeaway."
         ),
         "bullet_points": (
-            "- Format the summary field as concise bullet points (using '-' prefixes).\n"
-            "- Highlight the chronological or logical flow of ideas."
+            "- Format the summary as clear bullet points (- point).\n"
+            "- Highlight key chronological or logical developments."
         ),
     }
 
     selected_guideline = style_guidelines.get(style.lower(), style_guidelines["short"])
 
-    # SYSTEM PROMPT: Sets role, constraints, and behavior rules
+    # SYSTEM PROMPT: Role + Constraints + Few-Shot Example + Anti-Hallucination
     system_prompt = (
         "You are an expert executive research assistant and professional synthesizer of complex information.\n\n"
-        "Your mission:\n"
-        "Analyze the provided text objectively and produce a high-quality, structured summary.\n\n"
         "Strict Guidelines:\n"
         f"{selected_guideline}\n"
-        "- Extract exactly 3 to 5 core key points (actionable, clear takeaways).\n"
+        "- Extract exactly 3 to 5 core key points (clear, actionable takeaways).\n"
         "- Extract exactly 3 to 5 single-word or short-phrase keywords/topic tags.\n"
-        "- Do NOT hallucinate or extrapolate facts not present in the source text.\n"
-        "- Maintain an objective, neutral, professional tone.\n"
-        "- Output strictly in the requested JSON structure."
+        "- CRITICAL: Do NOT invent facts, assume unstated details, or extrapolate.\n"
+        "- Maintain an objective, neutral, professional tone.\n\n"
+        "--- FEW-SHOT DEMONSTRATION ---\n"
+        "Example Input:\n"
+        "'The Apollo 11 mission was the first spaceflight that landed humans on the Moon in July 1969. "
+        "American astronauts Neil Armstrong and Buzz Aldrin spent over two hours exploring the lunar surface.'\n"
+        "Example Output JSON:\n"
+        "{\n"
+        '  "summary": "Apollo 11 achieved the historic milestone of landing the first humans on the Moon in July 1969.",\n'
+        '  "key_points": [\n'
+        '    "Apollo 11 was the first spaceflight to land humans on the Moon in July 1969.",\n'
+        '    "Astronauts Neil Armstrong and Buzz Aldrin explored the lunar surface for over two hours."\n'
+        "  ],\n"
+        '  "keywords": ["Apollo 11", "Moon landing", "Neil Armstrong", "Space exploration"]\n'
+        "}\n"
+        "--- END OF DEMONSTRATION ---"
     )
 
-    # USER PROMPT: Provides the payload / raw text
+    # USER PROMPT: The actual payload
     user_prompt = (
         f"Please analyze and summarize the following text according to the '{style}' style:\n\n"
-        "--- START OF TEXT ---\n"
+        "--- SOURCE TEXT ---\n"
         f"{text.strip()}\n"
-        "--- END OF TEXT ---"
+        "--- END OF SOURCE TEXT ---"
     )
 
     return system_prompt, user_prompt
 
 
 # =====================================================================
-# 3. PROVIDER FUNCTIONS (OpenAI & Google Gemini)
+# 3. FUNCTION CALLING DEFINITION
 # =====================================================================
-# Each provider is kept in its own small, isolated function.
-# This makes switching providers seamless and easy to maintain.
+# How does Function Calling differ from Structured Output?
+# - Structured Output: Tells the LLM "Format your text answer directly
+#   as valid JSON matching this schema."
+# - Function Calling: Tells the LLM "You have access to a tool named
+#   save_summary(). Do not output text; call this function with arguments."
+# Function calling is the foundation of AI Agents that take real actions.
 # =====================================================================
 
-def call_openai(system_prompt: str, user_prompt: str, model: str, api_key: str) -> Tuple[str, SummaryResponse]:
+def save_summary(summary: str, key_points: list[str], keywords: list[str]) -> dict:
     """
-    Calls the OpenAI API using the official openai Python SDK.
-    Uses OpenAI's native Structured Outputs feature (client.beta.chat.completions.parse)
-    which guarantees 100% schema compliance.
+    Saves the structured summary containing executive summary, key points, and keywords.
+    
+    Args:
+        summary: The summary of the source text.
+        key_points: 3 to 5 core takeaways.
+        keywords: 3 to 5 relevant topic tags.
     """
-    try:
-        from openai import OpenAI, OpenAIError, AuthenticationError, APIConnectionError
-    except ImportError:
-        raise RuntimeError("OpenAI SDK is not installed. Run: pip install openai")
-
-    client = OpenAI(api_key=api_key)
-
-    # What is Temperature?
-    # Temperature controls randomness:
-    # 0.0 = deterministic, focused, predictable (great for summarization & facts)
-    # 1.0 = creative, varied (great for creative writing)
-    # We use 0.2 for accurate, grounded summarization.
-    completion = client.beta.chat.completions.parse(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        response_format=SummaryResponse,
-        temperature=0.2,
-    )
-
-    # Raw JSON string received directly from the model
-    raw_json_str = completion.choices[0].message.content
-    # Parsed Pydantic instance provided by OpenAI SDK
-    parsed_response = completion.choices[0].message.parsed
-
-    if not parsed_response:
-        # Fallback manual parse if parsed object is None
-        parsed_response = SummaryResponse.model_validate_json(raw_json_str)
-
-    return raw_json_str, parsed_response
+    return {
+        "summary": summary,
+        "key_points": key_points,
+        "keywords": keywords,
+    }
 
 
-def call_gemini(system_prompt: str, user_prompt: str, model: str, api_key: str) -> Tuple[str, SummaryResponse]:
+# =====================================================================
+# 4. GEMINI API CALL FUNCTIONS
+# =====================================================================
+
+def call_gemini_structured(
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+    api_key: str,
+) -> Tuple[str, SummaryResponse]:
     """
-    Calls the Google Gemini API using the official google-genai SDK.
-    Uses Gemini's structured output configuration (response_schema=SummaryResponse).
+    Calls Google Gemini using native Structured Output (response_schema).
     """
-    try:
-        from google import genai
-        from google.genai import types
-        from google.genai.errors import APIError
-    except ImportError:
-        raise RuntimeError("Google GenAI SDK is not installed. Run: pip install google-genai")
-
     client = genai.Client(api_key=api_key)
 
-    # Configure Gemini for Structured JSON Output
     config = types.GenerateContentConfig(
         system_instruction=system_prompt,
         response_mime_type="application/json",
@@ -202,99 +196,282 @@ def call_gemini(system_prompt: str, user_prompt: str, model: str, api_key: str) 
     if not raw_json_str:
         raise ValueError("Gemini returned an empty response.")
 
-    # Parse and validate against the Pydantic schema
     parsed_response = SummaryResponse.model_validate_json(raw_json_str)
     return raw_json_str, parsed_response
 
 
+def clean_markdown_json(raw: str) -> str:
+    """Strips markdown code fences (```json ... ```) if present."""
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[1]
+        if cleaned.endswith("```"):
+            cleaned = cleaned.rsplit("```", 1)[0]
+    return cleaned.strip()
+
+
+def get_function_tool() -> types.Tool:
+    """
+    Defines the save_summary function schema for Gemini Function Calling.
+    Using FunctionDeclaration gives strict control without AFC auto-execution overhead.
+    """
+    func_decl = types.FunctionDeclaration(
+        name="save_summary",
+        description="Saves the structured summary containing executive summary, key points, and keywords.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "summary": types.Schema(
+                    type=types.Type.STRING,
+                    description="The executive summary of the source text."
+                ),
+                "key_points": types.Schema(
+                    type=types.Type.ARRAY,
+                    items=types.Schema(type=types.Type.STRING),
+                    description="3 to 5 core key points from the text."
+                ),
+                "keywords": types.Schema(
+                    type=types.Type.ARRAY,
+                    items=types.Schema(type=types.Type.STRING),
+                    description="3 to 5 topic keywords or tags."
+                ),
+            },
+            required=["summary", "key_points", "keywords"],
+        ),
+    )
+    return types.Tool(function_declarations=[func_decl])
+
+
+def call_gemini_function(
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+    api_key: str,
+) -> Tuple[str, SummaryResponse]:
+    """
+    Calls Google Gemini using Function Calling (tools=[save_summary]).
+    The model generates a tool call containing the structured arguments.
+    """
+    client = genai.Client(api_key=api_key)
+    tool = get_function_tool()
+
+    fc_system_prompt = (
+        f"{system_prompt}\n\n"
+        "You have access to the save_summary tool. "
+        "Invoke save_summary with the extracted summary, key_points, and keywords."
+    )
+
+    config = types.GenerateContentConfig(
+        system_instruction=fc_system_prompt,
+        tools=[tool],
+        tool_config=types.ToolConfig(
+            function_calling_config=types.FunctionCallingConfig(
+                mode="ANY",
+                allowed_function_names=["save_summary"],
+            )
+        ),
+    )
+
+    response = client.models.generate_content(
+        model=model,
+        contents=user_prompt,
+        config=config,
+    )
+
+    # 1. Extract arguments from function call
+    if response.function_calls:
+        first_call = response.function_calls[0]
+        call_args = dict(first_call.args)
+        raw_json_str = json.dumps(call_args, indent=2)
+        parsed_response = SummaryResponse(**call_args)
+        return raw_json_str, parsed_response
+
+    # 2. Fallback: Parse text response (stripping markdown fences if present)
+    if response.text:
+        cleaned_json = clean_markdown_json(response.text)
+        parsed_response = SummaryResponse.model_validate_json(cleaned_json)
+        return cleaned_json, parsed_response
+
+    raise ValueError("Gemini did not invoke the function or return text.")
+
+
+
+
 # =====================================================================
-# 4. SUMMARIZATION DISPATCHER & ERROR HANDLING
+# 5. COOKBOOK IDEA: MAP-REDUCE CHUNKING FOR LONG TEXTS
+# =====================================================================
+# How Chunking Works:
+# When text is very long, it may exceed context budgets or lose focus.
+# Map-Reduce splits the text into chunks:
+# 1. Map Step: Summarize each chunk individually into concise notes.
+# 2. Reduce Step: Combine all chunk summaries into a final structured summary.
+# =====================================================================
+
+def chunk_text(text: str, max_chars: int = 900) -> List[str]:
+    """
+    Splits text into manageable chunks respecting paragraphs.
+    """
+    paragraphs = text.split("\n\n")
+    chunks = []
+    current_chunk = []
+    current_length = 0
+
+    for para in paragraphs:
+        para_clean = para.strip()
+        if not para_clean:
+            continue
+        if current_length + len(para_clean) > max_chars and current_chunk:
+            chunks.append("\n\n".join(current_chunk))
+            current_chunk = [para_clean]
+            current_length = len(para_clean)
+        else:
+            current_chunk.append(para_clean)
+            current_length += len(para_clean)
+
+    if current_chunk:
+        chunks.append("\n\n".join(current_chunk))
+
+    return chunks if chunks else [text]
+
+
+def summarize_with_chunks(
+    text: str,
+    style: str,
+    model: str,
+    api_key: str,
+    mode: str = "structured",
+) -> Tuple[str, SummaryResponse]:
+    """
+    Map-Reduce summarizer for long documents.
+    """
+    import time
+    chunks = chunk_text(text)
+    print(f"\n[Map-Reduce] Document split into {len(chunks)} chunks.", flush=True)
+
+    client = genai.Client(api_key=api_key)
+    intermediate_summaries = []
+
+    # Map Step: Summarize each chunk
+    for i, chunk in enumerate(chunks, 1):
+        print(f"  -> [Map {i}/{len(chunks)}] Processing chunk ({len(chunk):,} chars)...", flush=True)
+        prompt = f"Condense the following section into 2-3 essential sentences:\n\n{chunk}"
+        for attempt in range(3):
+            try:
+                res = client.models.generate_content(model=model, contents=prompt)
+                intermediate_summaries.append(res.text.strip())
+                time.sleep(2)  # Courteous pause to respect Gemini RPM rate limit
+                break
+            except Exception as e:
+                err_str = str(e)
+                if ("503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str or "RESOURCE_EXHAUSTED" in err_str) and attempt < 2:
+                    print(f"     [Backoff] Rate limit or spike detected. Pausing 8s before retry (attempt {attempt+2}/3)...", flush=True)
+                    time.sleep(8)
+                    continue
+                raise
+
+    # Reduce Step: Synthesize all chunk summaries into final structured output
+    print("  -> [Reduce Step] Synthesizing all chunk summaries into final structured output...", flush=True)
+    combined_intermediate = "\n\n".join(
+        [f"Section {i+1} Summary:\n{s}" for i, s in enumerate(intermediate_summaries)]
+    )
+
+    system_prompt, user_prompt = build_prompt(combined_intermediate, style)
+
+    if mode == "function":
+        return call_gemini_function(system_prompt, user_prompt, model, api_key)
+    return call_gemini_structured(system_prompt, user_prompt, model, api_key)
+
+
+# =====================================================================
+# 6. PIPELINE DISPATCHER & ERROR HANDLING
 # =====================================================================
 
 def summarize_text(
     text: str,
-    style: str,
-    provider: str,
-    openai_key: Optional[str] = None,
+    style: str = "short",
+    mode: str = "structured",
+    use_langchain: bool = False,
+    use_chunk: bool = False,
     gemini_key: Optional[str] = None,
-    openai_model: str = DEFAULT_OPENAI_MODEL,
     gemini_model: str = DEFAULT_GEMINI_MODEL,
 ) -> Tuple[str, SummaryResponse]:
     """
-    Validates inputs, builds prompts, dispatches to the selected provider,
-    and handles potential network and API errors with clear user feedback.
+    Validates inputs and routes the request to the appropriate method.
     """
-    # 1. Validation: Empty or whitespace text
     if not text or not text.strip():
-        raise ValueError("Input text is empty! Please provide meaningful text to summarize.")
+        raise ValueError("Input text is empty! Please provide valid text to summarize.")
 
-    # 2. Validation: Text length safeguard (approx 30,000 characters ~ 7,500 tokens)
-    char_count = len(text)
-    if char_count > 35000:
+    if not gemini_key or gemini_key.startswith("your_") or "here" in gemini_key:
         raise ValueError(
-            f"Input text is too long ({char_count:,} characters). "
-            "Please limit input to under 35,000 characters to prevent context window overflow."
+            "Missing or invalid GEMINI_API_KEY in your .env file.\n"
+            "Get your free key from: https://aistudio.google.com/app/apikey"
         )
 
-    # 3. Build Prompt
-    system_prompt, user_prompt = build_prompt(text, style)
+    # Character count guardrail
+    char_count = len(text)
+    if char_count > 35000 and not use_chunk:
+        raise ValueError(
+            f"Input text is {char_count:,} characters (exceeds 35,000 char threshold).\n"
+            "Please add the --chunk flag to summarize long text using Map-Reduce!"
+        )
 
-    provider_clean = provider.strip().lower()
-
-    # 4. Dispatch to selected provider
-    if provider_clean == "openai":
-        if not openai_key or openai_key.startswith("your_") or "here" in openai_key:
-            raise ValueError(
-                "Missing or invalid OPENAI_API_KEY in your .env file.\n"
-                "Get an API key from https://platform.openai.com/api-keys\n"
-                "or set PROVIDER=gemini in .env to use Google Gemini."
-            )
+    import time
+    for attempt in range(2):
         try:
-            return call_openai(system_prompt, user_prompt, openai_model, openai_key)
+            # Route 1: LangChain Mode
+            if use_langchain:
+                from summarizer_langchain import summarize_with_langchain
+                return summarize_with_langchain(text, style, gemini_key, gemini_model)
+
+            # Route 2: Chunking (Map-Reduce) Mode
+            if use_chunk:
+                return summarize_with_chunks(text, style, gemini_model, gemini_key, mode)
+
+            # Route 3: Standard Structured vs Function Calling
+            system_prompt, user_prompt = build_prompt(text, style)
+
+            if mode == "function":
+                return call_gemini_function(system_prompt, user_prompt, gemini_model, gemini_key)
+            else:
+                return call_gemini_structured(system_prompt, user_prompt, gemini_model, gemini_key)
+
         except Exception as e:
             err_msg = str(e)
-            if "AuthenticationError" in type(e).__name__ or "invalid_api_key" in err_msg.lower():
-                raise ConnectionError("Authentication failed: Your OpenAI API key is invalid or expired.")
-            elif "APIConnectionError" in type(e).__name__ or "Connection" in type(e).__name__:
-                raise ConnectionError("No internet connection or cannot reach OpenAI servers.")
-            elif "RateLimitError" in type(e).__name__ or "quota" in err_msg.lower():
-                raise ConnectionError("OpenAI quota exceeded or rate limit hit. Check your OpenAI billing or switch to PROVIDER=gemini.")
-            raise RuntimeError(f"OpenAI error: {err_msg}")
-
-    elif provider_clean == "gemini":
-        if not gemini_key or gemini_key.startswith("your_") or "here" in gemini_key:
-            raise ValueError(
-                "Missing or invalid GEMINI_API_KEY in your .env file.\n"
-                "Get your free API key from https://aistudio.google.com/app/apikey and paste it in .env"
-            )
-        try:
-            return call_gemini(system_prompt, user_prompt, gemini_model, gemini_key)
-        except Exception as e:
-            err_msg = str(e)
+            if ("503" in err_msg or "UNAVAILABLE" in err_msg) and attempt == 0:
+                print("\n[Notice] Gemini service busy (503). Retrying automatically in 4s...", flush=True)
+                time.sleep(4)
+                continue
             if "API_KEY_INVALID" in err_msg or "PERMISSION_DENIED" in err_msg:
-                raise ConnectionError("Authentication failed: Your Gemini API key is invalid or lacks permissions.")
+                raise ConnectionError("Authentication failed: Your Gemini API key is invalid.")
+            elif "NOT_FOUND" in err_msg or "404" in err_msg:
+                raise ConnectionError(
+                    f"Model '{gemini_model}' was not found (404). "
+                    "Update GEMINI_MODEL in your .env file."
+                )
+            elif "UNAVAILABLE" in err_msg or "503" in err_msg:
+                raise ConnectionError(
+                    "Gemini service is temporarily experiencing high demand (503). "
+                    "Please retry in a few moments."
+                )
+            elif "RESOURCE_EXHAUSTED" in err_msg or "429" in err_msg:
+                raise ConnectionError("Rate limit exceeded (429). Please slow down requests.")
             elif "Connection" in type(e).__name__ or "timeout" in err_msg.lower():
-                raise ConnectionError("No internet connection or cannot reach Google Gemini servers.")
-            raise RuntimeError(f"Gemini error: {err_msg}")
-
-    else:
-        raise ValueError(f"Unknown PROVIDER '{provider}' in .env. Please set PROVIDER to 'openai' or 'gemini'.")
+                raise ConnectionError("Network connection error. Check your internet connection.")
+            raise RuntimeError(f"Summarizer error: {err_msg}")
 
 
 # =====================================================================
-# 5. RESULT DISPLAY & FORMATTING
+# 7. DISPLAY RESULTS
 # =====================================================================
 
-def display_result(raw_json_str: str, result: SummaryResponse, style: str, provider: str):
+def display_result(raw_json_str: str, result: SummaryResponse, style: str, mode: str):
     """
-    Displays the raw JSON payload first (for learning/inspection),
-    followed by a beautifully formatted breakdown of the summary,
-    key points, and keywords.
+    Prints the raw JSON response once, then the formatted output.
     """
-    print("\n" + "=" * 65)
-    print(" [STEP 1] RAW JSON RESPONSE FROM MODEL")
-    print("=" * 65)
-    print("Notice how the LLM returned exact, validated JSON without markdown fences:\n")
+    print("\n" + "=" * 65, flush=True)
+    print(f" [STEP 1] RAW JSON RESPONSE FROM MODEL (Mode: {mode.upper()})", flush=True)
+    print("=" * 65, flush=True)
+    print("Notice the raw JSON data received from Gemini:\n", flush=True)
 
     if RICH_AVAILABLE:
         syntax = Syntax(raw_json_str, "json", theme="monokai", line_numbers=True)
@@ -302,16 +479,14 @@ def display_result(raw_json_str: str, result: SummaryResponse, style: str, provi
     else:
         print(raw_json_str)
 
-    print("\n" + "=" * 65)
-    print(" [STEP 2] PARSED & BEAUTIFULLY FORMATTED OUTPUT")
-    print("=" * 65)
+    print("\n" + "=" * 65, flush=True)
+    print(" [STEP 2] PARSED & BEAUTIFULLY FORMATTED OUTPUT", flush=True)
+    print("=" * 65, flush=True)
 
     if RICH_AVAILABLE:
-        # Display Summary Panel
-        title = f"[bold green]Executive Summary ({style.upper()} - Provider: {provider.upper()})[/bold green]"
+        title = f"[bold green]Executive Summary ({style.upper()} - Mode: {mode.upper()})[/bold green]"
         console.print(Panel(result.summary, title=title, border_style="cyan", padding=(1, 2)))
 
-        # Display Key Points Table
         table = Table(title="[bold yellow]Key Takeaways[/bold yellow]", show_header=True, header_style="bold magenta")
         table.add_column("#", style="dim", width=4, justify="center")
         table.add_column("Point", style="white")
@@ -320,13 +495,12 @@ def display_result(raw_json_str: str, result: SummaryResponse, style: str, provi
             table.add_row(str(idx), f"[white]{point}[/white]")
         console.print(table)
 
-        # Display Keywords
         keyword_badges = " ".join([f"[black on cyan] #{kw.strip('# ')} [/black on cyan]" for kw in result.keywords])
         console.print("\n[bold yellow]Keywords & Tags:[/bold yellow]")
         console.print(keyword_badges)
         console.print()
     else:
-        print(f"\n--- SUMMARY ({style.upper()} | {provider.upper()}) ---")
+        print(f"\n--- SUMMARY ({style.upper()}) ---")
         print(result.summary)
         print("\n--- KEY POINTS ---")
         for idx, pt in enumerate(result.key_points, 1):
@@ -337,15 +511,12 @@ def display_result(raw_json_str: str, result: SummaryResponse, style: str, provi
 
 
 # =====================================================================
-# 6. USER INPUT HELPER FUNCTIONS
+# 8. INPUT HELPERS
 # =====================================================================
 
 def read_input() -> str:
     """
-    Guides the user interactively to either:
-    1. Paste text directly.
-    2. Provide a .txt file path.
-    3. Use the built-in sample.txt file.
+    Menu for reading text interactively.
     """
     print("\nSelect input method:")
     print("  [1] Paste text directly")
@@ -355,8 +526,7 @@ def read_input() -> str:
     while True:
         choice = input("\nEnter choice (1, 2, or 3): ").strip()
         if choice == "1":
-            print("\nPaste your text below.")
-            print("(When finished, type 'END' on a new line and press Enter):\n")
+            print("\nPaste your text below. (Type 'END' on a new line when done):\n")
             lines = []
             while True:
                 try:
@@ -372,55 +542,31 @@ def read_input() -> str:
             print("Error: No text entered. Please try again.")
 
         elif choice == "2":
-            file_path = input("\nEnter the path to your .txt file: ").strip().strip('"\'')
-            if not file_path:
-                print("Error: File path cannot be empty.")
-                continue
-            if not file_path.lower().endswith(".txt"):
-                print("Warning: File does not have a .txt extension, attempting to read anyway...")
-
+            file_path = input("\nEnter .txt file path: ").strip().strip('"\'')
             if not os.path.isfile(file_path):
-                print(f"Error: File '{file_path}' not found. Check the path and try again.")
+                print(f"Error: File '{file_path}' not found.")
                 continue
-
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                if not content:
-                    print(f"Error: File '{file_path}' is empty.")
-                    continue
-                print(f"Successfully loaded {len(content):,} characters from '{file_path}'.")
-                return content
-            except UnicodeDecodeError:
-                try:
-                    with open(file_path, "r", encoding="latin-1") as f:
-                        return f.read().strip()
-                except Exception as e:
-                    print(f"Error reading file encoding: {e}")
-            except Exception as e:
-                print(f"Error reading file: {e}")
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read().strip()
 
         elif choice == "3":
-            sample_path = os.path.join(os.path.dirname(__file__), "sample.txt")
+            sample_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample.txt")
             if os.path.isfile(sample_path):
                 with open(sample_path, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                print(f"Loaded 'sample.txt' ({len(content):,} characters).")
-                return content
-            else:
-                print("Error: 'sample.txt' not found in project folder.")
+                    return f.read().strip()
+            print("Error: 'sample.txt' not found.")
         else:
-            print("Invalid choice. Please enter 1, 2, or 3.")
+            print("Invalid choice. Enter 1, 2, or 3.")
 
 
 def choose_style() -> str:
     """
-    Prompts the user to select their desired summary style.
+    Menu for selecting style.
     """
     print("\nChoose summary style:")
     print("  [1] Short (Concise, 2-3 sentences)")
     print("  [2] Detailed (Comprehensive paragraph)")
-    print("  [3] Bullet Points (Crisp bullet-pointed takeaways)")
+    print("  [3] Bullet Points (Bullet-pointed key takeaways)")
 
     while True:
         choice = input("\nEnter choice (1, 2, or 3) [default: 1]: ").strip()
@@ -430,20 +576,18 @@ def choose_style() -> str:
             return "detailed"
         elif choice == "3":
             return "bullet_points"
-        else:
-            print("Invalid choice. Enter 1, 2, or 3.")
+        print("Invalid choice. Enter 1, 2, or 3.")
 
 
 # =====================================================================
-# 7. MAIN APPLICATION ENTRYPOINT
+# 9. MAIN CLI ENTRYPOINT
 # =====================================================================
 
 def main():
-    # Load environment variables from .env file
     load_dotenv()
 
     parser = argparse.ArgumentParser(
-        description="AI Text Summarizer - CLI tool with OpenAI and Gemini Structured Outputs."
+        description="AI Text Summarizer - Google Gemini Edition (Structured Outputs, Function Calling, LangChain, Chunks)."
     )
     parser.add_argument("-f", "--file", help="Path to a .txt file to summarize.")
     parser.add_argument("-t", "--text", help="Raw text string to summarize directly.")
@@ -452,66 +596,86 @@ def main():
         help="Summary style: 'short', 'detailed', or 'bullet_points'."
     )
     parser.add_argument(
-        "-p", "--provider", choices=["openai", "gemini"],
-        help="Override LLM provider ('openai' or 'gemini')."
+        "-m", "--mode", choices=["structured", "function"], default="structured",
+        help="Summarization mode: 'structured' (default) or 'function' (Gemini function calling)."
+    )
+    parser.add_argument(
+        "--langchain", action="store_true",
+        help="Run summarization using LangChain LCEL chain."
+    )
+    parser.add_argument(
+        "--chunk", action="store_true",
+        help="Use Map-Reduce chunking for long documents."
+    )
+    parser.add_argument(
+        "--web", action="store_true",
+        help="Launch the browser web application interface."
     )
 
     args = parser.parse_args()
 
-    # Determine provider and configuration
-    env_provider = os.getenv("PROVIDER", "openai").strip().lower()
-    provider = args.provider or env_provider
+    # If --web flag is given, start the web interface
+    if args.web:
+        import uvicorn
+        from app import app
+        print("\nStarting AI Text Summarizer Web App at http://127.0.0.1:8001 ...")
+        uvicorn.run(app, host="127.0.0.1", port=8001)
+        return
 
-    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-    openai_model = os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL).strip()
     gemini_model = os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL).strip()
 
-    # Welcome banner
-    print("\n" + "=" * 65)
-    print("   AI TEXT SUMMARIZER (CLI) - Structured Outputs Edition")
-    print("=" * 65)
-    print(f" Active Provider : {provider.upper()}")
-    if provider == "openai":
-        print(f" Active Model    : {openai_model}")
-        print(f" API Key Loaded  : {'Yes' if openai_key and not openai_key.startswith('your_') else 'No (Check .env)'}")
+    # Determine mode label
+    if args.langchain:
+        active_mode = "langchain"
+    elif args.mode == "function":
+        active_mode = "function"
     else:
-        print(f" Active Model    : {gemini_model}")
-        print(f" API Key Loaded  : {'Yes' if gemini_key and not gemini_key.startswith('your_') else 'No (Check .env)'}")
-    print("=" * 65)
+        active_mode = "structured"
 
-    # 1. Obtain input text (from CLI flags or interactive prompt)
+    # Banner
+    print("\n" + "=" * 65, flush=True)
+    print("   AI TEXT SUMMARIZER - Google Gemini Edition", flush=True)
+    print("=" * 65, flush=True)
+    print(f" Provider       : Google Gemini", flush=True)
+    print(f" Model          : {gemini_model}", flush=True)
+    print(f" Mode           : {active_mode.upper()}", flush=True)
+    print(f" Chunking       : {'Enabled' if args.chunk else 'Disabled'}", flush=True)
+    print(f" API Key Loaded : {'Yes' if gemini_key and not gemini_key.startswith('your_') else 'No'}", flush=True)
+    print("=" * 65, flush=True)
+
+    # 1. Get Text
     if args.file:
         if not os.path.isfile(args.file):
             print(f"Error: Specified file '{args.file}' does not exist.")
             sys.exit(1)
-        with open(args.file, "r", encoding="utf-8") as f:
+        with open(args.file, "r", encoding="utf-8", errors="ignore") as f:
             text = f.read().strip()
     elif args.text:
         text = args.text.strip()
     else:
         text = read_input()
 
-    # 2. Obtain style (from CLI flag or interactive prompt)
+    # 2. Get Style
     style = args.style or choose_style()
 
-    # 3. Perform Summarization
-    print(f"\nProcessing text with {provider.upper()} ({style} style)... Please wait...")
+    # 3. Summarize
+    print(f"\nProcessing text with Gemini ({active_mode} mode, {style} style)... Please wait...\n", flush=True)
     try:
         raw_json_str, result = summarize_text(
             text=text,
             style=style,
-            provider=provider,
-            openai_key=openai_key,
+            mode=args.mode,
+            use_langchain=args.langchain,
+            use_chunk=args.chunk,
             gemini_key=gemini_key,
-            openai_model=openai_model,
             gemini_model=gemini_model,
         )
-        # 4. Display Results (raw JSON first, then formatted)
-        display_result(raw_json_str, result, style, provider)
+        # 4. Display
+        display_result(raw_json_str, result, style, active_mode)
 
     except (ValueError, ConnectionError, RuntimeError) as err:
-        print(f"\n[ERROR] {err}\n")
+        print(f"\n[ERROR] {err}\n", flush=True)
         sys.exit(1)
     except KeyboardInterrupt:
         print("\n\nOperation cancelled by user.")
